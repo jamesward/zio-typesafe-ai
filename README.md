@@ -1,5 +1,7 @@
 # zio-typesafe-ai
 
+[![javadocs.dev](https://www.javadocs.dev/com.jamesward/zio-typesafe-ai_3/badge.svg)](https://www.javadocs.dev/com.jamesward/zio-typesafe-ai_3/latest)
+
 A Scala 3 / ZIO library for [TypeSafe AI](https://docs.typesafe.ai/introduction)'s
 Jev / System One API — a "System One model" that answers typed, atomic
 questions about a piece of state instead of generating text.
