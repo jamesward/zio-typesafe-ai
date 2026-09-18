@@ -174,6 +174,10 @@ with `Error.MaxIterations`.
 An action handler may run arbitrary ZIO effects—MCP calls, database operations,
 or a no-tool generative model call—while Jev remains the outer decision loop.
 
+See [docs/loop-architecture.md](docs/loop-architecture.md) for diagrams of the
+loop's components, one iteration's request path, its per-iteration validation
+gates and failure exits, and what `LoopResult` accumulates.
+
 ## Errors
 
 ```scala
