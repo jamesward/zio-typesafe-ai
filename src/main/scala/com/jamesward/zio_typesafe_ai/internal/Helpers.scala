@@ -58,22 +58,23 @@ private[zio_typesafe_ai] object Helpers:
       case null             => Json.Null
       case content: Content => content.json
 
-  /** Decode one wire `Answer` into the public [[Question]]'s matching
-    * answer type. The `(question, answer)` match is exhaustive over
-    * every legitimate pairing; a mismatch (Jev answering a `Noul`
-    * question with a `choice`, say) is a genuine protocol violation,
-    * not a case we failed to enumerate — it falls through to the
-    * catch-all as `Error.MalformedAnswer`. */
-  def fromWireAnswer(qid: QuestionId, question: Question[?], answer: Wire.Answer): Either[Error, Any] =
+  /** Decode one wire answer while retaining its runtime Jev variant. */
+  def fromWireDynamicAnswer(
+    qid: QuestionId,
+    question: Question[?],
+    answer: Wire.Answer,
+  ): Either[Error, DynamicAnswer] =
     (question, answer) match
       case (_: Question.Noul[?], Wire.Answer.Noul(v)) =>
-        Probability(v).left.map(Error.MalformedAnswer(qid, _))
+        Probability(v)
+          .left.map(Error.MalformedAnswer(qid, _))
+          .map(DynamicAnswer.Noul(_))
 
       case (_: Question.Choice[?], Wire.Answer.Choice(choice, probabilities, confidence)) =>
         for
           probs <- traverseProbabilities(probabilities).left.map(Error.MalformedAnswer(qid, _))
           conf  <- Probability(confidence).left.map(Error.MalformedAnswer(qid, _))
-        yield ChoiceAnswer(choice, probs, conf)
+        yield DynamicAnswer.Choice(ChoiceAnswer(choice, probs, conf))
 
       case (_: Question.Score[?], Wire.Answer.Score(score, legend, probabilities, confidence)) =>
         for
@@ -81,10 +82,17 @@ private[zio_typesafe_ai] object Helpers:
           lvlProbs  <- parseLevelKeys(probabilities).left.map(Error.MalformedAnswer(qid, _))
           probs     <- traverseProbabilities(lvlProbs).left.map(Error.MalformedAnswer(qid, _))
           conf      <- Probability(confidence).left.map(Error.MalformedAnswer(qid, _))
-        yield ScoreAnswer(score, lvlLegend, probs, conf)
+        yield DynamicAnswer.Score(ScoreAnswer(score, lvlLegend, probs, conf))
 
       case _ =>
         Left(Error.MalformedAnswer(qid, s"answer type doesn't match the question that was asked: $answer"))
+
+  /** Decode one wire `Answer` for the compile-time NamedTuple path. */
+  def fromWireAnswer(qid: QuestionId, question: Question[?], answer: Wire.Answer): Either[Error, Any] =
+    fromWireDynamicAnswer(qid, question, answer).map:
+      case DynamicAnswer.Noul(probability) => probability
+      case DynamicAnswer.Choice(value)     => value
+      case DynamicAnswer.Score(value)      => value
 
   private def traverseProbabilities[K](m: Map[K, Double]): Either[String, Map[K, Probability]] =
     m.foldLeft[Either[String, Map[K, Probability]]](Right(Map.empty)):

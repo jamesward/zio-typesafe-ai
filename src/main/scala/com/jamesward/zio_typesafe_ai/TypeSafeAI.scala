@@ -1,6 +1,6 @@
 package com.jamesward.zio_typesafe_ai
 
-import com.jamesward.zio_typesafe_ai.internal.{Codecs, Helpers, Http, RequestImpl, Wire}
+import com.jamesward.zio_typesafe_ai.internal.{Codecs, Helpers, Http, LoopImpl, RequestImpl, Wire}
 import zio.*
 import zio.direct.*
 import zio.http.{Client as HClient, Status}
@@ -240,6 +240,14 @@ object TypeSafeAI:
     confidence:    Probability,
   )
 
+  /** Runtime answer shape for [[askDynamic]]. Unlike [[AnswerOf]], which
+    * preserves a compile-time NamedTuple's exact field types, this ADT keeps
+    * the three Jev answer variants explicit in a runtime-sized map. */
+  enum DynamicAnswer:
+    case Noul(probability: Probability)
+    case Choice(answer: ChoiceAnswer)
+    case Score(answer: ScoreAnswer)
+
   /** Per-question answer type, selected by the registered [[Question]]
     * subtype. A `Noul` question answers with a bare [[Probability]] —
     * no wrapper needed, since "the probability the answer is yes" is
@@ -279,6 +287,31 @@ object TypeSafeAI:
     * the registered questions. */
   case class Result[+T](answers: T, model: ModelId, usage: Usage)
 
+  /** One host-generated action Jev may select during a loop iteration. */
+  case class LoopOption[+A](id: String, value: A, description: Content)
+
+  object LoopOption:
+    def text[A](id: String, value: A, description: String): LoopOption[A] =
+      LoopOption(id, value, Content(description))
+
+  /** Result of handling one Jev-selected action. */
+  enum LoopStep[S, +O]:
+    case Continue(state: S)
+    case Done(output: O)
+
+  /** Decision metadata for one Jev loop iteration. */
+  case class LoopTurn(
+    iteration: Int,
+    choice: String,
+    answer: ChoiceAnswer,
+    usage: Usage,
+    latencyMs: Long,
+  )
+
+  /** Final loop output, every decision turn, aggregate Jev usage, and
+    * aggregate wall-clock time spent in Jev requests. */
+  case class LoopResult[+O](output: O, turns: List[LoopTurn], usage: Usage, latencyMs: Long)
+
   // ---------- Errors ----------
 
   sealed trait Error extends Throwable:
@@ -317,6 +350,10 @@ object TypeSafeAI:
     /** Jev's response omitted an answer for a question that was asked. */
     final case class MissingAnswer      (questionId: QuestionId)          extends Error:
       def errorMessage = s"No answer returned for question '$questionId'"
+    final case class InvalidLoop       (message: String)                  extends Error:
+      def errorMessage = s"Invalid Jev loop: $message"
+    final case class MaxIterations     (iterations: Int)                  extends Error:
+      def errorMessage = s"Jev loop exceeded maxIterations = $iterations"
 
     private[zio_typesafe_ai] def fromStatus(status: Status, body: String): Error =
       status.code match
@@ -423,6 +460,53 @@ object TypeSafeAI:
     def run: ZIO[Client, Error, Result[NamedTuple.NamedTuple[Names, AnswersOf[Values]]]] =
       RequestImpl.run(this)
 
+
+  /** Pure-data builder returned by [[askDynamic]]. Questions may be assembled
+    * at runtime; answers therefore return as a map of explicit
+    * [[DynamicAnswer]] variants rather than a compile-time NamedTuple. */
+  final class DynamicSystemOneRequest private[zio_typesafe_ai] (
+    private[zio_typesafe_ai] val state: Content,
+    private[zio_typesafe_ai] val model: Option[ModelId],
+    private[zio_typesafe_ai] val entries: List[(QuestionId, Question[?])],
+  ):
+    /** Override the model for this request; defaults to the `Client` model. */
+    def model(m: ModelId): DynamicSystemOneRequest =
+      new DynamicSystemOneRequest(state, Some(m), entries)
+
+    /** Runtime-sized answers keyed by the supplied question ids. */
+    def answers: ZIO[Client, Error, Map[QuestionId, DynamicAnswer]] =
+      run.map(_.answers)
+
+    /** Full response envelope including resolved model and token usage. */
+    def run: ZIO[Client, Error, Result[Map[QuestionId, DynamicAnswer]]] =
+      RequestImpl.runDynamic(this)
+  /** Configurable Jev-driven state-machine loop. Host code renders state,
+    * generates valid actions, and handles the selected action as Continue or
+    * Done. */
+  final class LoopRequest[S, A, R, E, O] private[zio_typesafe_ai] (
+    private[zio_typesafe_ai] val initial: S,
+    private[zio_typesafe_ai] val stateView: S => Content,
+    private[zio_typesafe_ai] val options: S => ZIO[R, E, NonEmptyChunk[LoopOption[A]]],
+    private[zio_typesafe_ai] val handler: (S, A) => ZIO[R, E, LoopStep[S, O]],
+    private[zio_typesafe_ai] val model: Option[ModelId],
+    private[zio_typesafe_ai] val maxIter: Int,
+  ):
+    def model(value: ModelId): LoopRequest[S, A, R, E, O] =
+      new LoopRequest(initial, stateView, options, handler, Some(value), maxIter)
+
+    def maxIterations(value: Int): LoopRequest[S, A, R, E, O] =
+      new LoopRequest(initial, stateView, options, handler, model, value)
+
+    def run: ZIO[Client & R, Error | E, LoopResult[O]] = LoopImpl.run(this)
+
+  def loop[S, A, R, E, O](initial: S)(
+    stateView: S => Content,
+    options: S => ZIO[R, E, NonEmptyChunk[LoopOption[A]]],
+  )(
+    handler: (S, A) => ZIO[R, E, LoopStep[S, O]],
+  ): LoopRequest[S, A, R, E, O] =
+    new LoopRequest(initial, stateView, options, handler, None, 10)
+
   /** Ask Jev one or more questions about `state` in a single round-trip.
     * The `NamedTuple`'s keys become both the wire question ids and the
     * field names of the `.answers` / `.run` result. `state` is generic
@@ -463,3 +547,24 @@ object TypeSafeAI:
     val values:  List[Question[?]] = questions.toTuple.toList.asInstanceOf[List[Question[?]]]
     val entries = names.iterator.zip(values.iterator).map((n, q) => (QuestionId(n), q)).toList
     new SystemOneRequest[Names, Values](Content(state), None, entries)
+
+
+  /** Ask a runtime-sized set of questions about one shared state in a single
+    * Jev round-trip. This complements [[ask]]: use `ask` when question names
+    * and answer types are known at compile time, and `askDynamic` for catalogs,
+    * candidates, or fan-out sets discovered at runtime.
+    *
+    * The iterable must be non-empty and question ids must be unique. The
+    * validated request preserves entry order on the wire; answers are keyed by
+    * [[QuestionId]] and retain their Jev variant in [[DynamicAnswer]]. */
+  def askDynamic[S: Schema](
+    state: S,
+    questions: Iterable[(QuestionId, Question[?])],
+  ): Either[String, DynamicSystemOneRequest] =
+    val entries = questions.iterator.toList
+    val duplicateIds = entries.groupMapReduce(_._1)(_ => 1)(_ + _).collect:
+      case (questionId, count) if count > 1 => questionId
+    if entries.isEmpty then Left("askDynamic requires at least one question")
+    else if duplicateIds.nonEmpty then
+      Left(s"askDynamic question ids must be unique; duplicates: ${duplicateIds.toList.sorted.mkString(", ")}")
+    else Right(new DynamicSystemOneRequest(Content(state), None, entries))

@@ -39,6 +39,10 @@ javaOptions ++= Seq(
   "--sun-misc-unsafe-memory-access=allow",
 )
 
+// sbt 2 maps plain `test` to incremental testQuick; CI and local release
+// validation should execute every suite, including live tests gated by env vars.
+Test / test := (Test / testFull).value
+
 licenses := Seq("MIT License" -> uri("https://opensource.org/licenses/MIT"))
 
 homepage := Some(uri("https://github.com/jamesward/zio-typesafe-ai"))

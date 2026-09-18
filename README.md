@@ -140,6 +140,40 @@ ScoreCriteria.fromContent(structuredLevelsList)          // for object/array lev
 A `null` `Choice` option description means "the option name is
 self-explanatory" (matches the wire's own `null` convention).
 
+## Jev-driven state-machine loops
+
+`TypeSafeAI.loop` repeatedly presents a host-generated finite action set to
+Jev as one `Choice`, handles the selected action, and either continues with a
+new state or completes. State and action types remain application-defined;
+only compact `Content` views and option descriptions are sent to Jev.
+
+```scala
+val request = TypeSafeAI.loop[Int, String, Any, Nothing, Int](0)(
+  state => Content(state),
+  _ => ZIO.succeed(NonEmptyChunk(
+    LoopOption.text("increment", "increment", "Increase the state by one."),
+    LoopOption.text("finish", "finish", "Return the current state."),
+  )),
+) { (state, action) =>
+  action match
+    case "increment" => ZIO.succeed(LoopStep.Continue(state + 1))
+    case "finish"    => ZIO.succeed(LoopStep.Done(state))
+}
+
+request.maxIterations(10).run
+// ZIO[Client, Error, LoopResult[Int]]
+```
+
+`LoopResult` contains the final output, every `LoopTurn` (selected choice,
+full `ChoiceAnswer`, usage, and Jev request latency), aggregate Jev usage, and
+aggregate Jev request latency. Option ids must be
+non-empty and unique. Unknown model choices, invalid options, and non-positive
+iteration limits fail with `Error.InvalidLoop`; exhausting the limit fails
+with `Error.MaxIterations`.
+
+An action handler may run arbitrary ZIO effects—MCP calls, database operations,
+or a no-tool generative model call—while Jev remains the outer decision loop.
+
 ## Errors
 
 ```scala
