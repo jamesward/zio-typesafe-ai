@@ -34,7 +34,7 @@ private[zio_typesafe_ai] object Helpers:
         Json.Obj(
           "type"         -> Json.Str("score"),
           "instructions" -> Codecs.toJsonAst(s.instructions)(using s.schema),
-          "criteria"     -> Json.Arr(s.criteria.levels.map(_.json)*),
+          "criteria"     -> Json.Arr(s.criteria.levels.map(contentOrNull)*),
         )
 
   private def noulCriteriaField(criteria: NoulCriteria | Null): List[(String, Json)] =
@@ -42,16 +42,10 @@ private[zio_typesafe_ai] object Helpers:
       case null =>
         Nil
       case nc: NoulCriteria =>
-        val fields = List(
-          contentField("true", nc.whenTrue),
-          contentField("false", nc.whenFalse),
-        ).flatten
-        if fields.isEmpty then Nil else List("criteria" -> Json.Obj(fields*))
-
-  private def contentField(name: String, c: Content | Null): Option[(String, Json)] =
-    c match
-      case null             => None
-      case content: Content => Some(name -> content.json)
+        List("criteria" -> Json.Obj(
+          "true"  -> contentOrNull(nc.whenTrue),
+          "false" -> contentOrNull(nc.whenFalse),
+        ))
 
   private def contentOrNull(c: Content | Null): Json =
     c match

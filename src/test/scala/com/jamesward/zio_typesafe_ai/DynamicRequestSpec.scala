@@ -89,18 +89,43 @@ object DynamicRequestSpec extends ZIOSpecDefault:
         case Left(other)                      => assertNever(s"expected MissingAnswer, got $other")
         case Right(value)                     => assertNever(s"expected failure, got $value")
     },
-    test("dynamic questions share the same structured state and retain every id") {
+    test("structured Choice matches the documented state/model/questions wire shape") {
       val state: Json = Json.Obj(
-        "goal" -> Json.Str("inspect library documentation"),
-        "catalog" -> Json.Arr(Json.Str("resolver"), Json.Str("list")),
+        "currentPlayerPiece" -> Json.Str("J"),
+        "boardRowsTopToBottom" -> Json.Arr(
+          Json.Arr(Json.Str("."), Json.Str("."), Json.Str(".")),
+          Json.Arr(Json.Str("J"), Json.Str("J"), Json.Str(".")),
+        ),
       )
-      val request = askDynamic(state, questions).toOption.get
+      val instructions: Json = Json.Obj(
+        "task" -> Json.Str("Choose a column using `boardRowsTopToBottom`"),
+        "rules" -> Json.Arr(Json.Str("Rows are ordered top to bottom")),
+      )
+      val criteria = ChoiceCriteria.fromContent(Map[String, Content | Null](
+        "column_0" -> null,
+        "column_1" -> null,
+        "column_2" -> null,
+      )).toOption.get
+      val entries: List[(QuestionId, Question[?])] = List(
+        QuestionId("move") -> Question.Choice(instructions, criteria)
+      )
+      val request = askDynamic(state, entries).toOption.get
       val wire = Helpers.toWireRequest(request.state, ModelId.JevLatest.unwrap, request.entries)
-      val root = wire.body.asObject.get
-      val encodedQuestions = root.get("questions").flatMap(_.asObject).get
-      assertTrue(
-        root.get("state").contains(state),
-        encodedQuestions.fields.map(_._1).toList == questions.map(_._1.unwrap),
+      val expected: Json = Json.Obj(
+        "state" -> state,
+        "model" -> Json.Str("jev-latest"),
+        "questions" -> Json.Obj(
+          "move" -> Json.Obj(
+            "type" -> Json.Str("choice"),
+            "instructions" -> instructions,
+            "criteria" -> Json.Obj(
+              "column_0" -> Json.Null,
+              "column_1" -> Json.Null,
+              "column_2" -> Json.Null,
+            ),
+          )
+        ),
       )
+      assertTrue(wire.body.equals(expected))
     },
   )

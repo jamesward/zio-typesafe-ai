@@ -4,6 +4,7 @@ import com.jamesward.zio_typesafe_ai.internal.{Codecs, Helpers, Http, LoopImpl, 
 import zio.*
 import zio.direct.*
 import zio.http.{Client as HClient, Status}
+import zio.json.*
 import zio.json.ast.Json
 import zio.schema.Schema
 
@@ -23,6 +24,9 @@ import zio.schema.Schema
  * typed answer — see [[AnswerOf]].
  */
 object TypeSafeAI:
+
+  type Middleware = TypeSafeAIMiddleware
+  val Middleware: TypeSafeAIMiddleware.type = TypeSafeAIMiddleware
 
   // ---------- Opaque domain types ----------
 
@@ -78,14 +82,13 @@ object TypeSafeAI:
     * value was passed, via `Codecs.toJsonAst`. See `Codecs` for why
     * `zio.json.ast.Json` rather than `DynamicValue`.
     *
-    * `state` and every [[Question]]'s `instructions` don't need this:
-    * they're generic in a `Schema` type parameter directly
-    * (`ask[S: Schema](state: S, ...)`, `Question.Noul[S: Schema](...)`),
-    * so reading them back is just the original, precisely-typed value —
-    * no `Content`, no decode step. `Content` only shows up for criteria
-    * descriptions, where [[ChoiceCriteria.apply]] / [[ScoreCriteria.apply]]
-    * handle it for you, or via the `fromContent` escape hatches for
-    * structured ones. */
+    * In the typed `ask` API, `state` and every [[Question]]'s instructions
+    * remain generic in their own `Schema` type and retain their precise public
+    * types. Heterogeneous criteria descriptions use `Content` through
+    * [[ChoiceCriteria.apply]], [[ScoreCriteria.apply]], or the `fromContent`
+    * escape hatches. The loop API also uses `Content` as the intentional
+    * serialized boundary for state views, option and choice instructions,
+    * semantic observations, and audit snapshots. */
   final class Content private[zio_typesafe_ai] (private[zio_typesafe_ai] val json: Json):
     def as[A: Schema]: Either[String, A] = Codecs.fromJsonAst(json)
 
@@ -95,8 +98,9 @@ object TypeSafeAI:
   // ---------- Questions ----------
 
   /** Clarifying `true`/`false` descriptions for a [[Question.Noul]].
-    * Both sides are optional — omitting a description leaves that
-    * outcome for Jev to interpret from the instructions alone. */
+    * The criteria object itself is optional on [[Question.Noul]]; when
+    * supplied, both entries are emitted and either description may be
+    * JSON `null`, as allowed by TypeSafe's `EntryType`. */
   final class NoulCriteria private (val whenTrue: Content | Null, val whenFalse: Content | Null)
   object NoulCriteria:
     def apply(whenTrue: String | Null = null, whenFalse: String | Null = null): NoulCriteria =
@@ -135,19 +139,22 @@ object TypeSafeAI:
 
   /** The ordered levels of a [[Question.Score]], low to high. Between 2
     * and 10 levels — enforced at construction. Build via
-    * [[ScoreCriteria.apply]] for plain-text levels, or
+    * [[ScoreCriteria.apply]] for plain-text or `null` levels, or
     * [[ScoreCriteria.fromContent]] for structured ones. */
-  final class ScoreCriteria private (val levels: List[Content]):
+  final class ScoreCriteria private (val levels: List[Content | Null]):
     def size: Int = levels.size
 
   object ScoreCriteria:
     val MinLevels = 2
     val MaxLevels = 10
 
-    def apply(levels: String*): Either[String, ScoreCriteria] =
-      fromContent(levels.map(Content(_)).toList)
+    def apply(levels: (String | Null)*): Either[String, ScoreCriteria] =
+      fromContent(levels.map {
+        case null => null
+        case s    => Content(s)
+      }.toList)
 
-    def fromContent(levels: List[Content]): Either[String, ScoreCriteria] =
+    def fromContent(levels: List[Content | Null]): Either[String, ScoreCriteria] =
       if levels.size < MinLevels || levels.size > MaxLevels then
         Left(s"Score.criteria needs between $MinLevels and $MaxLevels levels, got ${levels.size}")
       else
@@ -287,6 +294,54 @@ object TypeSafeAI:
     * the registered questions. */
   case class Result[+T](answers: T, model: ModelId, usage: Usage)
 
+  /** Outcome of one package-private `Client.send` exchange. A successful
+    * response is the complete decoded response re-encoded as canonical JSON;
+    * it is not the byte-exact HTTP response body. */
+  enum ExchangeOutcome:
+    case Success(response: Json)
+    case Failure(cause: Cause[Error])
+
+  /** Complete JSON request, exchange outcome, and elapsed wall-clock time.
+    * Deliberately contains no HTTP headers or bearer tokens. Bodies may still
+    * contain sensitive application state and model output. */
+  case class ExchangeObservation(request: Json, outcome: ExchangeOutcome, latencyMs: Long)
+
+  /** Best-effort observer of every physical System One exchange. */
+  trait ExchangeObserver:
+    def observe(observation: ExchangeObservation): UIO[Unit]
+
+  object ExchangeObserver:
+    val none: ExchangeObserver = fromFunction(_ => ZIO.unit)
+
+    def fromFunction(f: ExchangeObservation => UIO[Unit]): ExchangeObserver =
+      new ExchangeObserver:
+        def observe(observation: ExchangeObservation): UIO[Unit] = f(observation)
+
+    /** Logs complete request and canonical response bodies. Enable only where
+      * logs are approved to contain the state and answer payloads. */
+    val logging: ExchangeObserver = fromFunction: observation =>
+      observation.outcome match
+        case ExchangeOutcome.Success(response) =>
+          ZIO.logInfo(
+            s"TypeSafe AI exchange completed in ${observation.latencyMs}ms; request=${observation.request.toJson}; response=${response.toJson}"
+          )
+        case ExchangeOutcome.Failure(cause) =>
+          ZIO.logErrorCause(
+            s"TypeSafe AI exchange failed in ${observation.latencyMs}ms; request=${observation.request.toJson}",
+            cause,
+          )
+
+  /** Run a callback without allowing its defects or self-interruption to alter
+    * client/loop semantics. Observer failures are reported through ZIO's
+    * logger; a logger defect is itself suppressed as a last resort. */
+  private[zio_typesafe_ai] def notifyBestEffort(label: String)(effect: => UIO[Any]): UIO[Unit] =
+    ZIO.suspendSucceed(effect).unit
+      .catchAllCause(cause =>
+        ZIO.logErrorCause(s"$label observer failed", cause)
+          .catchAllCause(_ => ZIO.unit)
+      )
+      .uninterruptible
+
   /** One host-generated action Jev may select during a loop iteration. */
   case class LoopOption[+A](id: String, value: A, description: Content)
 
@@ -311,6 +366,45 @@ object TypeSafeAI:
   /** Final loop output, every decision turn, aggregate Jev usage, and
     * aggregate wall-clock time spent in Jev requests. */
   case class LoopResult[+O](output: O, turns: List[LoopTurn], usage: Usage, latencyMs: Long)
+
+  /** Retry configuration for each individual Jev decision request. The first
+    * retry waits `initialDelay`, with exponential backoff thereafter. */
+  case class LoopRetryPolicy(maxRetries: Int, initialDelay: Duration = 500.millis)
+
+  /** Serializable option metadata retained by loop observations and audits.
+    * The host action value is intentionally excluded. */
+  case class LoopAuditOption(id: String, description: Content)
+
+  /** State view and legal option metadata presented for one successful Jev
+    * decision. */
+  case class LoopAuditTurn(iteration: Int, stateView: Content, options: List[LoopAuditOption])
+
+  /** Opt-in state/option audit paired with the unchanged [[LoopResult]]. */
+  case class AuditedLoopResult[+O](result: LoopResult[O], audit: List[LoopAuditTurn]):
+    def output: O = result.output
+    def turns: List[LoopTurn] = result.turns
+    def usage: Usage = result.usage
+    def latencyMs: Long = result.latencyMs
+
+  /** Semantic lifecycle events for one logical loop execution. Retry attempts
+    * do not generate additional options or decision events. */
+  enum LoopObservation[+E, +O]:
+    case OptionsGenerated(iteration: Int, stateView: Content, options: List[LoopAuditOption])
+    case Decision(turn: LoopTurn)
+    case Completion(result: LoopResult[O])
+    case Failure(cause: Cause[Error | E], turns: List[LoopTurn])
+
+  /** Best-effort semantic observer for a loop with host error `E` and output
+    * `O`. Callback defects and self-interruption are isolated. */
+  trait LoopObserver[E, O]:
+    def observe(observation: LoopObservation[E, O]): UIO[Unit]
+
+  object LoopObserver:
+    def none[E, O]: LoopObserver[E, O] = make(_ => ZIO.unit)
+
+    def make[E, O](f: LoopObservation[E, O] => UIO[Unit]): LoopObserver[E, O] =
+      new LoopObserver[E, O]:
+        def observe(observation: LoopObservation[E, O]): UIO[Unit] = f(observation)
 
   // ---------- Errors ----------
 
@@ -395,6 +489,12 @@ object TypeSafeAI:
     private[zio_typesafe_ai] def send(req: Wire.SystemOneRequest): IO[Error, Wire.SystemOneResponse]
 
   object Client:
+    /** Decorates any existing client with exactly-once exchange observation.
+      * The underlying success value or full failure cause is re-emitted
+      * unchanged after the best-effort callback. */
+    def observed(observer: ExchangeObserver): URLayer[Client, Client] =
+      Middleware.fromObserver(observer).layer
+
     /** Build a `Client` from an explicit API key and model. */
     def layer(apiKey: ApiKey, modelId: ModelId = ModelId.JevLatest): ZLayer[HClient, Nothing, Client] =
       ZLayer.fromZIO:
@@ -480,32 +580,100 @@ object TypeSafeAI:
     /** Full response envelope including resolved model and token usage. */
     def run: ZIO[Client, Error, Result[Map[QuestionId, DynamicAnswer]]] =
       RequestImpl.runDynamic(this)
+  private val DefaultLoopChoiceInstructions = Content(
+    "Choose the single action that best advances the current state toward completion. Option ids are opaque; judge their structured descriptions."
+  )
+
   /** Configurable Jev-driven state-machine loop. Host code renders state,
     * generates valid actions, and handles the selected action as Continue or
-    * Done. */
+    * Done. Every copy-style method preserves all other configuration. */
   final class LoopRequest[S, A, R, E, O] private[zio_typesafe_ai] (
     private[zio_typesafe_ai] val initial: S,
     private[zio_typesafe_ai] val stateView: S => Content,
     private[zio_typesafe_ai] val options: S => ZIO[R, E, NonEmptyChunk[LoopOption[A]]],
-    private[zio_typesafe_ai] val handler: (S, A) => ZIO[R, E, LoopStep[S, O]],
+    private[zio_typesafe_ai] val handler: (S, A, LoopTurn) => ZIO[R, E, LoopStep[S, O]],
     private[zio_typesafe_ai] val model: Option[ModelId],
     private[zio_typesafe_ai] val maxIter: Int,
+    private[zio_typesafe_ai] val instructions: Content,
+    private[zio_typesafe_ai] val retryPolicy: LoopRetryPolicy,
+    private[zio_typesafe_ai] val observer: LoopObserver[E, O],
   ):
+    private def copy(
+      model: Option[ModelId] = model,
+      maxIter: Int = maxIter,
+      instructions: Content = instructions,
+      retryPolicy: LoopRetryPolicy = retryPolicy,
+      observer: LoopObserver[E, O] = observer,
+    ): LoopRequest[S, A, R, E, O] =
+      new LoopRequest(initial, stateView, options, handler, model, maxIter, instructions, retryPolicy, observer)
+
     def model(value: ModelId): LoopRequest[S, A, R, E, O] =
-      new LoopRequest(initial, stateView, options, handler, Some(value), maxIter)
+      copy(model = Some(value))
 
     def maxIterations(value: Int): LoopRequest[S, A, R, E, O] =
-      new LoopRequest(initial, stateView, options, handler, model, value)
+      copy(maxIter = value)
+
+    /** Replaces the default Choice instructions. Structured `Schema` values
+      * remain objects/arrays/null on the wire rather than being stringified. */
+    def choiceInstructions[I: Schema](value: I): LoopRequest[S, A, R, E, O] =
+      copy(instructions = Content(value))
+
+    /** Retries only retryable failures from each per-turn Jev request. */
+    def retryEachTurn(policy: LoopRetryPolicy): LoopRequest[S, A, R, E, O] =
+      copy(retryPolicy = policy)
+
+    def observe(value: LoopObserver[E, O]): LoopRequest[S, A, R, E, O] =
+      copy(observer = value)
 
     def run: ZIO[Client & R, Error | E, LoopResult[O]] = LoopImpl.run(this)
 
+    /** Runs with an additional Content-only snapshot of each successfully
+      * selected turn. Ordinary `run` does not return or retain this audit. */
+    def runAudited: ZIO[Client & R, Error | E, AuditedLoopResult[O]] = LoopImpl.runAudited(this)
+
+  /** Builds a Jev loop whose handler needs only the selected host action.
+    * Use [[loopWithTurn]] when the transition must inspect Jev's full
+    * probability distribution or other per-turn metadata. */
   def loop[S, A, R, E, O](initial: S)(
     stateView: S => Content,
     options: S => ZIO[R, E, NonEmptyChunk[LoopOption[A]]],
   )(
     handler: (S, A) => ZIO[R, E, LoopStep[S, O]],
   ): LoopRequest[S, A, R, E, O] =
-    new LoopRequest(initial, stateView, options, handler, None, 10)
+    new LoopRequest(
+      initial,
+      stateView,
+      options,
+      (state, action, _) => handler(state, action),
+      None,
+      10,
+      DefaultLoopChoiceInstructions,
+      LoopRetryPolicy(0),
+      LoopObserver.none,
+    )
+
+  /** Builds a Jev loop whose handler receives the completed [[LoopTurn]] for
+    * the selected action. The turn contains the full [[ChoiceAnswer]], so a
+    * host can retain several likely branches, confidence-gate a transition,
+    * or otherwise use the calibrated distribution before constructing the
+    * next state. */
+  def loopWithTurn[S, A, R, E, O](initial: S)(
+    stateView: S => Content,
+    options: S => ZIO[R, E, NonEmptyChunk[LoopOption[A]]],
+  )(
+    handler: (S, A, LoopTurn) => ZIO[R, E, LoopStep[S, O]],
+  ): LoopRequest[S, A, R, E, O] =
+    new LoopRequest(
+      initial,
+      stateView,
+      options,
+      handler,
+      None,
+      10,
+      DefaultLoopChoiceInstructions,
+      LoopRetryPolicy(0),
+      LoopObserver.none,
+    )
 
   /** Ask Jev one or more questions about `state` in a single round-trip.
     * The `NamedTuple`'s keys become both the wire question ids and the

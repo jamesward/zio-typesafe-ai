@@ -28,26 +28,51 @@ object TypeSafeAIMock:
     /** The call fails with the given error. */
     case class Fail(error: Error) extends MockBehavior
 
+  private case class MockState(
+    pending: Queue[MockBehavior],
+    requests: Vector[Wire.SystemOneRequest],
+  )
+
+  /** A reusable mock layer plus deterministic request capture. */
+  final class Tracked private[TypeSafeAIMock] (
+    val layer: ULayer[TypeSafeAI.Client],
+    private val state: Ref[MockState],
+  ):
+    def requests: UIO[List[Wire.SystemOneRequest]] = state.get.map(_.requests.toList)
+    def requestCount: UIO[Int] = state.get.map(_.requests.size)
+
+  /** Builds a mock whose sent wire requests can be inspected and counted. */
+  def tracked(behaviors: MockBehavior*): UIO[Tracked] =
+    Ref.make(MockState(Queue.from(behaviors.toIndexedSeq), Vector.empty)).map: state =>
+      new Tracked(ZLayer.succeed(client(state)), state)
+
   /** A `TypeSafeAI.Client` layer whose responses come from `behaviors`. */
   def apply(behaviors: MockBehavior*): ULayer[TypeSafeAI.Client] =
     ZLayer.fromZIO:
-      Ref.make(Queue.from(behaviors.toIndexedSeq)).map: ref =>
-        new TypeSafeAI.Client:
-          val modelId: ModelId = ModelId("mock")
-          def send(req: Wire.SystemOneRequest): IO[Error, Wire.SystemOneResponse] =
-            ref.modify:
-              case q if q.isEmpty => (None, q)
-              case q              => val (head, rest) = q.dequeue; (Some(head), rest)
-            .flatMap:
-              case None =>
-                ZIO.fail(Error.Unexpected(
-                  zio.http.Status.InternalServerError,
-                  "Mock script exhausted: more `send` rounds than scripted behaviors",
-                ))
-              case Some(MockBehavior.Respond(answers, usage)) =>
-                // `req.body` is the assembled request JSON, not a typed
-                // case class — nothing here needs to echo the real
-                // requested model back, so just report the mock's own id.
-                ZIO.succeed(Wire.SystemOneResponse(model = modelId.unwrap, answers = answers, usage = usage))
-              case Some(MockBehavior.Fail(error)) =>
-                ZIO.fail(error)
+      Ref.make(MockState(Queue.from(behaviors.toIndexedSeq), Vector.empty)).map(client)
+
+  private def client(state: Ref[MockState]): TypeSafeAI.Client =
+    new TypeSafeAI.Client:
+      val modelId: ModelId = ModelId("mock")
+
+      def send(req: Wire.SystemOneRequest): IO[Error, Wire.SystemOneResponse] =
+        state.modify: current =>
+          val recorded = current.requests :+ req
+          if current.pending.isEmpty then
+            (None, current.copy(requests = recorded))
+          else
+            val (head, rest) = current.pending.dequeue
+            (Some(head), MockState(rest, recorded))
+        .flatMap:
+          case None =>
+            ZIO.fail(Error.Unexpected(
+              zio.http.Status.InternalServerError,
+              "Mock script exhausted: more `send` rounds than scripted behaviors",
+            ))
+          case Some(MockBehavior.Respond(answers, usage)) =>
+            // `req.body` is the assembled request JSON, not a typed
+            // case class — nothing here needs to echo the real
+            // requested model back, so just report the mock's own id.
+            ZIO.succeed(Wire.SystemOneResponse(model = modelId.unwrap, answers = answers, usage = usage))
+          case Some(MockBehavior.Fail(error)) =>
+            ZIO.fail(error)

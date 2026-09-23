@@ -67,4 +67,30 @@ object LoopSpec extends ZIOSpecDefault:
         case Left(_: Error.InvalidLoop) => assertCompletes
         case other                      => assertNever(s"expected InvalidLoop, got $other")
     },
+    test("exposes the full probability-bearing turn to the handler") {
+      val probabilityAware = TypeSafeAI.loopWithTurn[List[(Int, Double, Double)], String, Any, Nothing, List[(Int, Double, Double)]](Nil)(
+        state => Content(state.size),
+        _ => ZIO.succeed(NonEmptyChunk(
+          LoopOption.text("increment", "increment", "Increase the state."),
+          LoopOption.text("finish", "finish", "Finish with observations."),
+        )),
+      ) { (state, action, turn) =>
+        val selectedProbability = turn.answer.probabilities(action).unwrap
+        val observed = state :+ (turn.iteration, selectedProbability, turn.answer.confidence.unwrap)
+        action match
+          case "increment" => ZIO.succeed(LoopStep.Continue(observed))
+          case "finish"    => ZIO.succeed(LoopStep.Done(observed))
+      }
+
+      probabilityAware.run.provideLayer(TypeSafeAIMock(
+        response("increment", 2, 1),
+        response("finish", 3, 1),
+      )).map: result =>
+        assertTrue(
+          result.output.map(_._1) == List(1, 2),
+          result.output.map(_._2) == List(0.7, 0.3),
+          result.output.map(_._3) == List(0.4, 0.4),
+          result.usage.inputTokens == 5,
+        )
+    },
   )

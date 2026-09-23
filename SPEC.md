@@ -26,15 +26,15 @@ Jev / System One API: `POST https://api.typesafe.ai/v1/systemone`.
      every `noul`, `confidence`, and probability-map value the service
      returns is one. A value outside that range can't reach it — decoding
      one fails closed as `Error.MalformedAnswer`, never silently clamped.
-4. **`state` and `instructions` are typed, not wrapped.** `ask` and every
+4. **Typed `ask` state and instructions are not wrapped.** `ask` and every
    `Question` factory are generic in a `Schema` type parameter directly
    (`ask[S: Schema](state: S, ...)`, `Question.Noul[S: Schema](instructions:
    S, ...)`) and keep `S` as a real type parameter on the built value —
    `question.instructions: S` reads back exactly what you passed in, no
-   decode step, no `Either`. Only criteria *descriptions* — several,
-   independently and possibly differently typed, inside one
-   `ChoiceCriteria` / `ScoreCriteria` / `NoulCriteria` — need an erasure
-   boundary at all; that's [[Content]] (see below).
+   decode step, no `Either`. Within typed `ask`, only heterogeneous criteria
+   descriptions need the `Content` erasure boundary. The loop API additionally
+   uses `Content` for serialized state views, options, configurable choice
+   instructions, observations, and audit snapshots.
 5. **No `DynamicValue`.** `state` / `instructions` / criteria
    descriptions are genuinely heterogeneous (any `Schema`-having type,
    varying per call and per question), so *some* "already a JSON value"
@@ -122,10 +122,10 @@ printer (`.toJson`) — real, tested code from both libraries, no
 hand-rolled JSON string escaping anywhere.
 
 The result: `zio.schema.DynamicValue` does not appear anywhere in this
-codebase. `Content` — the type that still needs *some* erasure, because
-several independently-typed criteria descriptions live together in one
-`ChoiceCriteria` / `ScoreCriteria` / `NoulCriteria` — wraps
-`zio.json.ast.Json` instead.
+codebase. `Content` wraps `zio.json.ast.Json` wherever a stable serialized
+erasure boundary is needed: heterogeneous criteria descriptions in typed
+questions, and loop state views, option/choice instructions, observations,
+and audit snapshots.
 
 ## Authentication & configuration
 
@@ -153,8 +153,10 @@ object TypeSafeAI:
   object Probability:
     def apply(value: Double): Either[String, Probability]   // private[zio_typesafe_ai]
 
-  /** Wraps a zio-json `Json` node — never `DynamicValue`. Only needed
-    * for criteria descriptions; `state` / `instructions` stay `S`. */
+  /** Wraps a zio-json `Json` node — never `DynamicValue`. In typed `ask`
+    * requests it erases heterogeneous criteria descriptions; loops also use
+    * it for serialized state views, option/choice instructions, observations,
+    * and audit snapshots. */
   final class Content private (json: zio.json.ast.Json):
     def as[A: Schema]: Either[String, A]
   object Content:
@@ -171,11 +173,11 @@ object TypeSafeAI:
     def apply(options: (String, String | Null)*): Either[String, ChoiceCriteria]
     def fromContent(options: Map[String, Content | Null]): Either[String, ChoiceCriteria]
 
-  final class ScoreCriteria private (val levels: List[Content]):
+  final class ScoreCriteria private (val levels: List[Content | Null]):
     def size: Int
   object ScoreCriteria:                         // 2..10 levels
-    def apply(levels: String*): Either[String, ScoreCriteria]
-    def fromContent(levels: List[Content]): Either[String, ScoreCriteria]
+    def apply(levels: (String | Null)*): Either[String, ScoreCriteria]
+    def fromContent(levels: List[Content | Null]): Either[String, ScoreCriteria]
 
   sealed trait Question[S]
   object Question:
@@ -216,7 +218,19 @@ object TypeSafeAI:
   trait Client:
     def modelId: ModelId
     private[zio_typesafe_ai] def send(req: Wire.SystemOneRequest): IO[Error, Wire.SystemOneResponse]
+  enum ExchangeOutcome:
+    case Success(response: Json)
+    case Failure(cause: Cause[Error])
+  case class ExchangeObservation(request: Json, outcome: ExchangeOutcome, latencyMs: Long)
+  trait ExchangeObserver:
+    def observe(observation: ExchangeObservation): UIO[Unit]
+  object ExchangeObserver:
+    val none: ExchangeObserver
+    def fromFunction(f: ExchangeObservation => UIO[Unit]): ExchangeObserver
+    val logging: ExchangeObserver
+
   object Client:
+    def observed(observer: ExchangeObserver): URLayer[Client, Client]
     def layer(apiKey: ApiKey, modelId: ModelId = ModelId.JevLatest): ZLayer[HClient, Nothing, Client]
     val  live:                                                       ZLayer[HClient, Error, Client]
 
@@ -241,6 +255,37 @@ object TypeSafeAI:
     inline all: AllQuestions[Values],
   ): SystemOneRequest[Names, Values]
 ```
+
+## Loop API additions
+
+`loop` and `loopWithTurn` retain their existing signatures and descriptors. Their builder adds copy-style `.choiceInstructions[I: Schema](value)`, `.retryEachTurn(LoopRetryPolicy)`, `.observe(LoopObserver[E, O])`, and `.runAudited`; `.model`, `.maxIterations`, and all new methods preserve every other setting.
+
+```scala
+case class LoopRetryPolicy(maxRetries: Int, initialDelay: Duration = 500.millis)
+case class LoopAuditOption(id: String, description: Content)
+case class LoopAuditTurn(iteration: Int, stateView: Content, options: List[LoopAuditOption])
+case class AuditedLoopResult[+O](result: LoopResult[O], audit: List[LoopAuditTurn]):
+  def output: O
+  def turns: List[LoopTurn]
+  def usage: Usage
+  def latencyMs: Long
+
+enum LoopObservation[+E, +O]:
+  case OptionsGenerated(iteration: Int, stateView: Content, options: List[LoopAuditOption])
+  case Decision(turn: LoopTurn)
+  case Completion(result: LoopResult[O])
+  case Failure(cause: Cause[Error | E], turns: List[LoopTurn])
+
+trait LoopObserver[E, O]:
+  def observe(observation: LoopObservation[E, O]): UIO[Unit]
+object LoopObserver:
+  def none[E, O]: LoopObserver[E, O]
+  def make[E, O](f: LoopObservation[E, O] => UIO[Unit]): LoopObserver[E, O]
+```
+
+Observers are best-effort and cannot replace client/loop semantics with callback defects or interruption. Exchange events contain no headers/tokens but do contain potentially sensitive full bodies. Successful exchange response JSON is the complete decoded `SystemOneResponse` canonically re-encoded, not byte-exact HTTP response bytes.
+
+Semantic loop ordering is validated options → options event → Jev → decision event → handler → recursion/completion. One outer terminal failure event carries the accumulated turns and `Cause[Error | E]`. Per-turn retries apply only to the dynamic Jev request and only for `RateLimit`, `ServiceOverloaded`, and `InternalServer`; default is zero retries. Retry latency includes attempts/backoff, while usage is available only from the successful response. Audit is opt-in, retains only `Content` state plus option id/description snapshots, and grows with turns/options; ordinary `run` retains and returns the unchanged `LoopResult`.
 
 ## Errors
 
@@ -314,12 +359,12 @@ object TypeSafeAIMock:
     case class Fail(error: TypeSafeAI.Error) extends MockBehavior
 
   def apply(behaviors: MockBehavior*): ULayer[TypeSafeAI.Client]
+  def tracked(behaviors: MockBehavior*): UIO[Tracked] // layer + requests/requestCount
 ```
 
 One behavior scripts one `send` — i.e. one whole `ask(...).run` call,
-since System One has no multi-turn concept. The mock ignores the
-assembled request body entirely (it's a `zio.json.ast.Json` tree, not a
-typed case class — nothing about the response depends on it).
+since System One has no multi-turn concept. `tracked` records every assembled
+request (including retry attempts) without changing scripted behavior.
 
 ## Test layout
 
