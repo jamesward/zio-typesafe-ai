@@ -1,5 +1,5 @@
 {
   "enabledMcpjsonServers": [
-    "sbt-mcp-zio-typesafe-ai"
+    "sbta"
   ]
 }
