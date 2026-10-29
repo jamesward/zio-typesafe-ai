@@ -61,4 +61,4 @@ ThisBuild / versionScheme := Some("semver-spec")
 // SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.17" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.19" % Skills
