@@ -1,5 +1,10 @@
 # zio-typesafe-ai
 
+> [!WARNING]
+> **Deprecated.** This library is no longer maintained. Use [zio-decisions](https://github.com/jamesward/zio-decisions)
+> (`"com.jamesward" %% "zio-decisions"`) instead: it's the same API renamed and made provider-neutral, with TypeSafe AI's
+> Jev as its `typesafe.TypeSafe` decision model.
+
 [![javadocs.dev](https://www.javadocs.dev/com.jamesward/zio-typesafe-ai_3/badge.svg)](https://www.javadocs.dev/com.jamesward/zio-typesafe-ai_3/latest)
 
 A Scala 3 / ZIO library for [TypeSafe AI](https://docs.typesafe.ai/introduction)'s
